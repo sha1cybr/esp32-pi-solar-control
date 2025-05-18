@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Temperature Monitor</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .container {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .sensors {
+            display: flex;
+            justify-content: space-around;
+            margin-bottom: 20px;
+        }
+        .sensor-card {
+            background-color: #f5f5f5;
+            border-radius: 10px;
+            padding: 20px;
+            width: 45%;
+            text-align: center;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .solar { border-left: 5px solid #ff9800; }
+        .tank { border-left: 5px solid #2196f3; }
+        .temp-value {
+            font-size: 32px;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        .chart-container {
+            position: relative;
+            height: 400px;
+            background-color: #f5f5f5;
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            background-color: #ddd;
+            cursor: pointer;
+        }
+        button.active {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .time-display {
+            text-align: center;
+            color: #666;
+            margin-top: 5px;
+        }
+        .faucet-card {
+            background-color: #f5f5f5;
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            border-left: 5px solid #9c27b0;
+        }
+        .faucet-status {
+            font-size: 24px;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        .status-opened {
+            color: #4CAF50;
+        }
+        .status-closed {
+            color: #f44336;
+        }
+        .faucet-button {
+            margin-top: 10px;
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #9c27b0;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        .faucet-button:hover {
+            background-color: #7B1FA2;
+        }
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 10px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .legend-color {
+            width: 20px;
+            height: 3px;
+        }
+        .faucet-open {
+            background-color: #4CAF50;
+        }
+        .faucet-closed {
+            background-color: #f44336;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ESP32 Temperature Monitor</h1>
+        
+        <div class="sensors">
+            <div class="sensor-card solar">
+                <h2>SOLAR Temperature</h2>
+                <div class="temp-value" id="solar-temp">--</div>
+                <div>°C</div>
+            </div>
+            <div class="sensor-card tank">
+                <h2>TANK Temperature</h2>
+                <div class="temp-value" id="tank-temp">--</div>
+                <div>°C</div>
+            </div>
+        </div>
+        
+        <div class="faucet-card">
+            <h2>FAUCET STATUS</h2>
+            <div class="faucet-status" id="faucet-status">--</div>
+            <button class="faucet-button" id="faucet-toggle">TOGGLE</button>
+        </div>
+        
+        <div class="controls">
+            <button id="btn-minute" onclick="changeTimeframe('minute')">Minute</button>
+            <button id="btn-hour" onclick="changeTimeframe('hour')" class="active">Hour</button>
+            <button id="btn-day" onclick="changeTimeframe('day')">Day</button>
+            <button id="btn-week" onclick="changeTimeframe('week')">Week</button>
+        </div>
+        
+        <div class="chart-container">
+            <canvas id="tempChart"></canvas>
+        </div>
+        
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-color faucet-open"></div>
+                <span>Faucet Open</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color faucet-closed"></div>
+                <span>Faucet Closed</span>
+            </div>
+        </div>
+        
+        <div class="time-display">
+            Last updated: <span id="last-update">--</span>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let tempChart;
+        let currentTimeframe = 'hour';
+        let faucetClosed = null;
+        
+        // Register the custom chart plugin for faucet events
+        Chart.register({
+            id: 'faucetEventsPlugin',
+            afterDraw: (chart) => {
+                const ctx = chart.ctx;
+                const xAxis = chart.scales.x;
+                const yAxis = chart.scales.y;
+                const faucetEvents = chart.faucetEvents || [];
+                
+                // Draw vertical lines for faucet events
+                faucetEvents.forEach(event => {
+                    if (event.index !== undefined && event.index >= 0 && event.index < chart.data.labels.length) {
+                        const x = xAxis.getPixelForValue(event.index);
+                        
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.moveTo(x, yAxis.top);
+                        ctx.lineTo(x, yAxis.bottom);
+                        ctx.lineWidth = 2;
+                        ctx.strokeStyle = event.closed ? '#f44336' : '#4CAF50'; // Red for closed, green for open
+                        ctx.stroke();
+                        ctx.restore();
+                    }
+                });
+            }
+        });
+        
+        // Initialize chart
+        function initChart() {
+            const ctx = document.getElementById('tempChart').getContext('2d');
+            Chart.register(faucetEventsPlugin);
+            tempChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Solar Temperature',
+                            data: [],
+                            borderColor: '#ff9800',
+                            backgroundColor: 'rgba(255, 152, 0, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2,
+                            fill: true
+                        },
+                        {
+                            label: 'Tank Temperature',
+                            data: [],
+                            borderColor: '#2196f3',
+                            backgroundColor: 'rgba(33, 150, 243, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2,
+                            fill: true
+                        }
+                    ]
+                },
+                options: {
+                    plugins: {
+                        faucetEventsPlugin: true
+                    },
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
+                    scales: {
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Time'
+                            }
+                        },
+                        y: {
+                            title: {
+                                display: true,
+                                text: 'Temperature (°C)'
+                            },
+                            suggestedMin: 0
+                        }
+                    }
+                }
+            });
+            
+            // Initialize empty faucet events array
+            tempChart.faucetEvents = [];
+        }
+        
+        // Format timestamp based on timeframe
+        function formatTimestamp(timestamp, timeframe) {
+            const date = new Date(timestamp * 1000);
+            
+            if (timeframe === 'minute') {
+                return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
+            } else if (timeframe === 'hour') {
+                return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            } else if (timeframe === 'day') {
+                return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            } else {
+                return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            }
+        }
+        
+        // Format current time
+        function formatCurrentTime() {
+            const now = new Date();
+            return now.toLocaleDateString() + ' ' + now.toLocaleTimeString();
+        }
+        
+        function updateChart(data) {
+            // Check if the expected data structure is present
+            if (!data.temperature_data || !Array.isArray(data.temperature_data)) {
+                console.error("Invalid temperature data format:", data);
+                return;
+            }
+            
+            if (!data.faucet_events || !Array.isArray(data.faucet_events)) {
+                console.error("Invalid faucet events format:", data);
+                data.faucet_events = []; // Initialize to empty array if missing
+            }
+            
+            const tempData = data.temperature_data;
+            const faucetEvents = data.faucet_events;
+            
+            // Format labels based on timeframe
+            const labels = tempData.map(item => formatTimestamp(item.ts, currentTimeframe));
+            const solarData = tempData.map(item => item.s);
+            const tankData = tempData.map(item => item.t);
+            
+            tempChart.data.labels = labels;
+            tempChart.data.datasets[0].data = solarData;
+            tempChart.data.datasets[1].data = tankData;
+            
+            // Process faucet events for chart display
+            const formattedEvents = [];
+            faucetEvents.forEach(event => {
+                // Find closest timestamp in temperature data
+                let closestIndex = -1;
+                let minDiff = Infinity;
+                
+                tempData.forEach((temp, index) => {
+                    const diff = Math.abs(temp.ts - event.ts);
+                    if (diff < minDiff) {
+                        minDiff = diff;
+                        closestIndex = index;
+                    }
+                });
+                
+                if (closestIndex >= 0) {
+                    formattedEvents.push({
+                        index: closestIndex,
+                        closed: event.c,
+                        timestamp: event.ts
+                    });
+                    console.log(`Added faucet event at index ${closestIndex}, closed: ${event.c}`);
+                }
+            });
+            
+            // Store faucet events in chart object for custom plugin
+            tempChart.faucetEvents = formattedEvents;
+            console.log(`Total faucet events: ${formattedEvents.length}`);
+            
+            // Update chart
+            tempChart.update();
+        }
+
+        // Register the custom chart plugin for faucet events
+        const faucetEventsPlugin = {
+            id: 'faucetEventsPlugin',
+            beforeDraw: function(chart) {
+                const ctx = chart.ctx;
+                const xAxis = chart.scales.x;
+                const yAxis = chart.scales.y;
+                const faucetEvents = chart.faucetEvents || [];
+                
+                console.log(`Drawing ${faucetEvents.length} faucet events`);
+                
+                // Draw vertical lines for faucet events
+                faucetEvents.forEach((event, eventIndex) => {
+                    if (event.index !== undefined && event.index >= 0 && event.index < chart.data.labels.length) {
+                        const xValue = event.index;
+                        const x = xAxis.getPixelForValue(xValue);
+                        
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.moveTo(x, yAxis.top);
+                        ctx.lineTo(x, yAxis.bottom);
+                        ctx.lineWidth = 3;
+                        ctx.strokeStyle = event.closed ? '#f44336' : '#4CAF50'; // Red for closed, green for open
+                        ctx.stroke();
+                        
+                        // Add small circle marker at the top
+                        ctx.beginPath();
+                        ctx.arc(x, yAxis.top + 10, 5, 0, 2 * Math.PI);
+                        ctx.fillStyle = event.closed ? '#f44336' : '#4CAF50';
+                        ctx.fill();
+                        
+                        ctx.restore();
+                        console.log(`Drew event ${eventIndex} at x: ${x}, index: ${event.index}, closed: ${event.closed}`);
+                    } else {
+                        console.log(`Skipped event ${eventIndex} with invalid index: ${event.index}`);
+                    }
+                });
+            }
+        };
+        
+        // Update the faucet display based on current status
+        function updateFaucetDisplay() {
+            const statusElement = document.getElementById('faucet-status');
+            const toggleButton = document.getElementById('faucet-toggle');
+            
+            if (faucetClosed === null) {
+                statusElement.innerText = '--';
+                statusElement.className = 'faucet-status';
+                toggleButton.innerText = 'TOGGLE';
+            } else if (faucetClosed) {
+                statusElement.innerText = 'CLOSED';
+                statusElement.className = 'faucet-status status-closed';
+                toggleButton.innerText = 'OPEN FAUCET';
+            } else {
+                statusElement.innerText = 'OPENED';
+                statusElement.className = 'faucet-status status-opened';
+                toggleButton.innerText = 'CLOSE FAUCET';
+            }
+        }
+        
+        // Fetch latest status (temperature and faucet)
+        function updateStatus() {
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('solar-temp').innerText = data.solar !== null ? data.solar : '--';
+                    document.getElementById('tank-temp').innerText = data.tank !== null ? data.tank : '--';
+                    document.getElementById('last-update').innerText = formatCurrentTime();
+                    
+                    // Update faucet status
+                    faucetClosed = data.faucet_closed;
+                    updateFaucetDisplay();
+                })
+                .catch(error => console.error('Error fetching status:', error));
+        }
+        
+        // Toggle faucet status
+        function toggleFaucet() {
+            // Toggle the status (if current status is known)
+            const newStatus = faucetClosed !== null ? !faucetClosed : false;
+            
+            // Send the new status to the server
+            fetch('/api/faucet', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ closed: newStatus })
+            })
+            .then(response => response.json())
+            .then(data => {
+                faucetClosed = data.closed;
+                updateFaucetDisplay();
+                // Refresh chart data to show the new faucet event
+                fetchHistoricalData();
+            })
+            .catch(error => console.error('Error updating faucet status:', error));
+        }
+        
+        // Fetch historical data for the chart
+        function fetchHistoricalData() {
+            fetch(`/api/data?timeframe=${currentTimeframe}`)
+                .then(response => response.json())
+                .then(data => {
+                    updateChart(data);
+                })
+                .catch(error => console.error('Error fetching historical data:', error));
+        }
+        
+        // Change timeframe and update UI
+        function changeTimeframe(timeframe) {
+            currentTimeframe = timeframe;
+            
+            // Update active button
+            document.querySelectorAll('.controls button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.getElementById(`btn-${timeframe}`).classList.add('active');
+            
+            // Fetch new data
+            fetchHistoricalData();
+        }
+        
+        // Initialize everything when page loads
+        window.onload = function() {
+            initChart();
+            updateStatus();
+            fetchHistoricalData();
+            
+            // Add event listener for faucet toggle button
+            document.getElementById('faucet-toggle').addEventListener('click', toggleFaucet);
+            
+            // Set up periodic updates
+            setInterval(updateStatus, 5 * 60 * 1000); // every 5 minutes
+            setInterval(fetchHistoricalData, 5 * 60 * 1000);
+        };
+    </script>
+</body>
+</html>
