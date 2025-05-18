@@ -1,11 +1,23 @@
-# esp32-pi-solar-control
+<h3 align="center" style="font-family: 'Fira Mono', Monospace;">esp32-pi-solar-control</h3>
+<p align="center">
+    <img src="resources/header.jpeg" alt="" width="400"/>
+</p>
 
-A Python-based project for monitoring solar energy data using BLE sensors and displaying the information through a web server.
+<h3 align="center" style="font-family: 'Fira Mono', Monospace;">ESP32/PiZero-powered solar valve control system</h3>
 
 ## Project Overview
 
-This project collects data from BLE sensors, processes it through a monitoring system, and makes it available via a web server. The data appears to be related to solar energy logging.
+esp32-pi-solar-control intelligently controls a water valve based on temperature readings from a solar water heating system. Its primary goal is to prevent energy loss by:
+* Measuring the temperature of both:
+    * The solar collector pipe (coming from the rooftop)
+    * The apartment’s water tank
+* Closing a motorized valve if the solar pipe is colder than the tank (i.e., when circulating solar-heated water would actually cool your tank instead of heating it).
+* Sending this data over Bluetooth Low Energy (BLE) to a Raspberry Pi Zero, which:
+* Logs and visualizes the temperature and valve status
 
+Hosts a simple web dashboard via FastAPI
+
+Does all of this locally, with no cloud or Wi-Fi dependency on the ESP32 side 
 
 ## Project Structure
 
