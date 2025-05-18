@@ -4,7 +4,8 @@ import onewire
 import uasyncio as asyncio
 from ble.client import BLEClient
 from machine import Pin, deepsleep
-from utils import connect_to_wifi
+
+from pizero.utils import connect_to_wifi
 
 SAMPLE_INTERVAL = 5  # seconds
 TEMP_THRESHOLD = 0.5 # celcius
