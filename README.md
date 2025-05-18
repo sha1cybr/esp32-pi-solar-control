@@ -13,9 +13,8 @@ esp32-pi-solar-control intelligently controls a water valve based on temperature
     * The apartment’s water tank
 * Closing a motorized valve if the solar pipe is colder than the tank (i.e., when circulating solar-heated water would actually cool your tank instead of heating it).
 * Sending this data over Bluetooth Low Energy (BLE) to a Raspberry Pi Zero, which:
-* Logs and visualizes the temperature and valve status
-
-Hosts a simple web dashboard via FastAPI
+    * Logs and visualizes the temperature and valve status
+    * Hosts a simple web dashboard via FastAPI
 
 Does all of this locally, with no cloud or Wi-Fi dependency on the ESP32 side 
 
