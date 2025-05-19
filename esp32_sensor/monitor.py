@@ -3,17 +3,16 @@ import ds18x20
 import onewire
 import uasyncio as asyncio
 from ble.client import BLEClient
+from ble.new_client import Sensor
 from machine import Pin, deepsleep
-
-from pizero.utils import connect_to_wifi
 
 SAMPLE_INTERVAL = 5  # seconds
 TEMP_THRESHOLD = 0.5 # celcius
 
-# Define the GPIO pins connected to the DS18B20 sensors
+# Define the GPIO pins connected to the DS18B20 sensors / valve control
 SOLAR_PIN = 13
 TANK_PIN = 14
-
+VALVE_CONTROL_PIN = 15
 
 class TemperatureSensor:
     def __init__(self, pin, name):
@@ -35,16 +34,52 @@ class TemperatureSensor:
             return round(temp, 2)
         return None
  
+class ValveControl:
+    def __init__(self, pin: int = VALVE_CONTROL_PIN):
+        self._pin = Pin(pin, Pin.OUT)
+        self._pin.value(0)
+        self._is_open: bool = False
+
+    def toggle(self, open: bool):
+        try:
+            if open:
+                self._open()
+            else:
+                self._close()
+        except Exception as e:
+            print("Error toggling valve:", e)
+
+    def _open(self):
+        if self._is_open:
+            print("Valve already open")
+            return
+        
+        print("Opening valve")
+        self._is_open = True
+        self._pin.value(1)
+
+    def _close(self):
+        if not self._is_open:
+            print("Valve already closed")
+            return
+        
+        print("Closing valve")
+        self._is_open = False
+        self._pin.value(0)
+
+    @property
+    def is_open(self):
+        return self._is_open
+
 def handle_message(obj):
     print(f"Gotr message from server {obj}")
     
 # Background task to read temperatures
 async def read_temperature_loop():
-    faucet_closed = False
     solar_sensor = TemperatureSensor(SOLAR_PIN, "SOLAR")
     tank_sensor = TemperatureSensor(TANK_PIN, "TANK")
-    
-    from ble.new_client import Sensor
+    valve = ValveControl()
+
     new_client = Sensor(server="solar")
     await new_client.advertise()
     
@@ -55,7 +90,8 @@ async def read_temperature_loop():
             
             print(f"SOLAR: {solar_temp}°C, TANK: {tank_temp}°C")
             should_open = solar_temp + TEMP_THRESHOLD > tank_temp
-            
+            valve.toggle(should_open)
+
             payload = {
                 "solar": solar_temp,
                 "tank": tank_temp,
