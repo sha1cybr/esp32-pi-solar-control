@@ -6,7 +6,7 @@ from ble.client import BLEClient
 from ble.new_client import Sensor
 from machine import Pin, deepsleep
 
-SAMPLE_INTERVAL = 5  # seconds
+SAMPLE_INTERVAL = 60 * 3  # seconds
 TEMP_THRESHOLD = 0.5 # celcius
 
 # Define the GPIO pins connected to the DS18B20 sensors / valve control
@@ -99,7 +99,7 @@ async def read_temperature_loop():
             }
             
             # Need to make sure this is read!
-            new_client.send_json(payload)
+            await new_client.send_json(payload)
             
         except Exception as e:
             print("Error reading temperature:", e)
