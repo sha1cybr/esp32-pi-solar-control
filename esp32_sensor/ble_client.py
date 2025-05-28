@@ -5,8 +5,6 @@ sys.path.append("")
 
 import asyncio
 import json
-import random
-import struct
 
 import aioble
 import bluetooth
@@ -27,10 +25,13 @@ class Sensor:
         self._server = server
         
         aioble.register_services(self._service)
+        self._event = asyncio.Event()
     
-    def send_json(self, obj):
+    async def send_json(self, obj):
         print(f"Publishing {obj}")
+        self._event.clear()
         self._temp_char.write(json.dumps(obj), send_update=True)
+        await self._event.wait()
     
     async def advertise(self):
         asyncio.create_task(self._advertise_task())
@@ -45,4 +46,6 @@ class Sensor:
             ) as connection:
                 print("Connection from", connection.device)
                 await connection.disconnected(timeout_ms=None)
+                self._event.set()
+                print("Disconnected", connection.device)
 
