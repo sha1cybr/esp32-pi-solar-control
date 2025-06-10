@@ -2,8 +2,7 @@ import aioble
 import ds18x20
 import onewire
 import uasyncio as asyncio
-from ble.client import BLEClient
-from ble.new_client import Sensor
+from sensor import Sensor
 from machine import Pin, deepsleep
 
 SAMPLE_INTERVAL = 60 * 3  # seconds
