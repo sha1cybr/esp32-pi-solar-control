@@ -148,17 +148,9 @@ def handle_command(cmd):
     if not cmd or not isinstance(cmd, dict):
         return
     
-    cmd_type = cmd.get('type')
+    print(f"Setting {cmd.get('type')} to {cmd.get('value')}")
+    state_manager.set(cmd.get('type'), cmd.get('value'))
     
-    if cmd_type == 'deepsleep_duration':
-        duration = cmd.get('value')
-        if duration and isinstance(duration, (int, float)) and duration > 0:
-            print(f"Setting deepsleep_duration to {duration} seconds")
-            state_manager.set('deepsleep_duration', duration)
-        else:
-            print("Invalid deepsleep_duration value")
-    else:
-        print(f"Unknown command type: {cmd_type}")
 
 # Background task to read temperatures
 async def read_temperature_loop():
