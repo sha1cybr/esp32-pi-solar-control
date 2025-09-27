@@ -4,15 +4,15 @@ import json
 import logging
 import os
 import socket
+from typing import Any
 
 import aiohttp_cors
 # Web server imports
 from aiohttp import web
 # BLE imports
 from bleak import BleakClient, BleakScanner
+from bless import BlessGATTCharacteristic, BlessServer, GATTAttributePermissions, GATTCharacteristicProperties
 from pydantic import BaseModel
-
-from solar_logger.solar_logger import SolarEventLogger
 
 # Set up logging
 logging.basicConfig(
@@ -21,8 +21,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress known bleak/dbus issues that don't affect functionality
+logging.getLogger('dbus_fast.message_bus').setLevel(logging.CRITICAL)
+logging.getLogger('bleak.backends.bluezdbus.manager').setLevel(logging.CRITICAL)
+
 TARGET_SERVICE_UUID = "0000181a-0000-1000-8000-00805f9b34fb"
 TEMPERATURE_CHAR_UUID = "00002a6e-0000-1000-8000-00805f9b34fb"
+
+# Pi peripheral service and characteristic UUIDs
+PI_SERVICE_UUID = "12345678-1234-1234-1234-123456789abc"
+COMMAND_CHAR_UUID = "87654321-4321-4321-4321-cba987654321"
+
+def command_read_request(characteristic: BlessGATTCharacteristic, **kwargs) -> bytearray:
+    """Handle read requests for the command characteristic"""
+    logger.debug(f"BLE client reading command characteristic: {characteristic.value}")
+    return characteristic.value
 
 class Metrics(BaseModel):
     solar: float = 0.0
@@ -30,24 +43,33 @@ class Metrics(BaseModel):
     faucet_closed: bool = False
     timestamp: int = 0
 
+class Command(BaseModel):
+    type: str
+    value: Any
+
 class TemperatureServer:
     """Combined BLE and Web Server implementation for Raspberry Pi"""
     
     def __init__(self, name="Raspberry Pi Server", web_port=8080):
-        self.name = name
-        self.web_port = web_port
-
-        self._solar_logger = SolarEventLogger()
+        self._name = name
+        self._web_port = web_port
         self._last_known_metrics = Metrics()
+        self._current_command = None
+        self._ble_server = None
+
+        self._command_ready_event = asyncio.Event()
+        self._command_read_event = asyncio.Event()
+
     
     async def start(self):
         """Start both servers"""
-        # Start both servers concurrently
+        # Start all servers concurrently
         await asyncio.gather(
             self.start_web_server(),
-            self.start_ble_discovery()
+            self.start_ble_discovery(),
+            self.start_ble_peripheral()
         )
-    
+
     async def start_ble_discovery(self):
         logger.info("Starting BLE discovery...")
         
@@ -57,41 +79,145 @@ class TemperatureServer:
 
                 target_device = None
                 for device in devices:
-                    if TARGET_SERVICE_UUID in device.metadata.get("uuids", []):
-                        target_device = device
-                        logger.info(f"Found matching device: {device.name} ({device.address})")
-                        break
-
+                    try:
+                        if hasattr(device, 'metadata') and device.metadata and TARGET_SERVICE_UUID in device.metadata.get("uuids", []):
+                            target_device = device
+                            logger.info(f"Found matching device: {device.name} ({device.address})")
+                            break
+                        elif device.name == 'solar':
+                            target_device = device
+                            logger.info(f"Found device by name: {device.name} ({device.address})")
+                            break
+                    except (AttributeError, KeyError) as e:
+                        # Skip devices that cause issues
+                        logger.debug(f"Skipping problematic device: {e}")
+                        continue
+                        
                 if not target_device:
                     logger.info("No device with Environmental Sensing Service found.")
+                    await asyncio.sleep(5)  # Wait before retrying
                     continue
 
                 async with BleakClient(target_device.address) as client:
                     logger.info(f"Connected to {target_device.name}")
-                    # logger.info("Services and characteristics:")
-
-                    # for service in client.services:
-                    #     logger.info(f"- Service: {service.uuid}")
-                    #     for char in service.characteristics:
-                    #         logger.info(f"  - Char: {char.uuid} | Properties: {char.properties}")
 
                     try:
                         temperature_bytes = await client.read_gatt_char(TEMPERATURE_CHAR_UUID)
                         payload = json.loads(temperature_bytes.decode('utf-8'))
                         logger.info(f"Payload: {payload}")
-                        if self._last_known_metrics.faucet_closed != payload.get("faucet_closed", False): 
-                            logger.info("Faucet closed")
-                            self._solar_logger.add_faucet_event(self._last_known_metrics.faucet_closed)
-
                         self._last_known_metrics.faucet_closed = payload.get("faucet_closed", False)
                         self._last_known_metrics.solar = payload.get("solar", 0.0)
                         self._last_known_metrics.tank = payload.get("tank", 0.0)
-                        self._last_known_metrics.timestamp = payload.get("timestamp", 0)
-                        self._solar_logger.add_reading(self._last_known_metrics.solar, self._last_known_metrics.tank)
+                        self._last_known_metrics.timestamp = int(asyncio.get_event_loop().time())
                     except Exception as e:
                         logger.info(f"Failed to read temperature: {e}")
+                        
+                # Wait before next reading
+                await asyncio.sleep(20)
+                    
             except Exception as e:
                 logger.error(f"BLE discovery error: {e}")
+                await asyncio.sleep(10)  # Wait longer on error
+    
+    def _command_read_request(self, characteristic: BlessGATTCharacteristic, **kwargs) -> bytearray:
+        """Handle read requests for the command characteristic"""
+        logger.debug(f"BLE client reading command characteristic: {characteristic.value}")
+        self._command_read_event.set()
+        return characteristic.value
+    
+    async def start_ble_peripheral(self):
+        """Start the BLE peripheral server"""
+        logger.info("Starting BLE peripheral...")
+        
+        while True:
+            await self._command_ready_event.wait()
+
+            try:
+                # Initialize BLE server with the current loop (using working configuration)
+                self._ble_server = BlessServer(name="pi", loop=asyncio.get_running_loop())
+                self._ble_server.read_request_func = self._command_read_request
+                self._ble_server.write_request_func = self._command_write_request
+
+                # Add the Pi service
+                await self._ble_server.add_new_service(PI_SERVICE_UUID)
+                logger.info(f"Added service: {PI_SERVICE_UUID}")
+                
+                # Add the command characteristic with working flags and permissions
+                char_flags = (GATTCharacteristicProperties.read | 
+                            GATTCharacteristicProperties.write | 
+                            GATTCharacteristicProperties.notify)
+                permissions = GATTAttributePermissions.readable | GATTAttributePermissions.writeable
+                
+                await self._ble_server.add_new_characteristic(
+                    PI_SERVICE_UUID,
+                    COMMAND_CHAR_UUID,
+                    char_flags,
+                    bytearray(json.dumps({"type": "none", "value": ""}).encode('utf-8')),  # Set initial value
+                    permissions
+                )
+                logger.info(f"Added characteristic: {COMMAND_CHAR_UUID}")
+                
+                # Start the server
+                await self._ble_server.start()
+                # Give it time to start advertising properly
+                await asyncio.sleep(3)
+                
+                logger.info("=" * 60)
+                logger.info("BLE PERIPHERAL STARTED SUCCESSFULLY!")
+                logger.info("=" * 60)
+                logger.info(f"Device Name: pi")
+                logger.info(f"Service UUID: {PI_SERVICE_UUID}")
+                logger.info(f"Characteristic UUID: {COMMAND_CHAR_UUID}")
+                logger.info("The 'pi' service should now be visible in BLE scanners!")
+                logger.info("=" * 60)
+
+                # Keep the peripheral running and update characteristic when needed
+                if self._current_command:
+                    command_json = json.dumps(self._current_command.model_dump())
+                    logger.info(f"Updating BLE characteristic with command: {command_json}")
+                    
+                    # Update the characteristic value
+                    char = self._ble_server.get_characteristic(COMMAND_CHAR_UUID)
+                    char.value = bytearray(command_json.encode('utf-8'))
+
+                # Wait for a read request from the client
+                await self._command_read_event.wait()
+                logger.info("BLE command characteristic was read by client.")
+                self._command_read_event.clear()
+
+            except Exception as e:
+                logger.error(f"BLE peripheral initialization error: {e}")
+                logger.warning("BLE peripheral functionality will be disabled.")
+                self._ble_server = None
+            finally:
+                if self._ble_server:
+                    await self._ble_server.stop()
+                    logger.info("BLE peripheral stopped")
+
+            self._command_ready_event.clear()
+        
+    
+    def _command_write_request(self, characteristic, value, **kwargs):
+        """Handle BLE write requests to the command characteristic"""
+        try:
+            # Decode the received command
+            command_str = value.decode('utf-8')
+            logger.info(f"BLE command received: {command_str}")
+            
+            # Parse JSON command
+            command_data = json.loads(command_str)
+            command = Command(**command_data)
+            
+            # Store the command (this will be picked up by the web API)
+            self._current_command = command
+            
+            logger.info(f"BLE command stored: {command.model_dump()}")
+            
+        except Exception as e:
+            logger.error(f"Error processing BLE write request: {e}")
+        
+        # Update the characteristic value to confirm receipt
+        characteristic.value = value
     
     def get_local_ip(self):
         try:
@@ -106,7 +232,7 @@ class TemperatureServer:
     
     async def start_web_server(self):
         """Start the web server"""
-        logger.info(f"Starting web server on port {self.web_port}...")
+        logger.info(f"Starting web server on port {self._web_port}...")
         
         # Create the web application
         app = web.Application()
@@ -124,24 +250,22 @@ class TemperatureServer:
         app.router.add_get('/', self.handle_index)
         app.router.add_static('/static/', path='static', name='static')
 
-        # Add API routes
-        api_routes = [
-            web.get('/api/status', self.handle_status),
-            web.get('/api/data', self.handle_get_data)
-        ]
+        # Add API routes with CORS
+        app.router.add_get('/api/metrics', self.handle_get_metrics)
+        app.router.add_get('/api/command', self.handle_get_command)
+        app.router.add_post('/api/command', self.handle_post_command)
         
-        # Apply CORS to all API routes
-        for route in api_routes:
-            app.router.add_route(route.method, route.path, route.handler)
-            cors.add(app.router.add_resource(route.path))
+        # Add CORS to all routes
+        for resource in app.router.resources():
+            cors.add(resource)
         
         # Start the web server
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', self.web_port)
+        site = web.TCPSite(runner, '0.0.0.0', self._web_port)
         await site.start()
         
-        logger.info(f"Web server running at http://{self.get_local_ip()}:{self.web_port}")
+        logger.info(f"Web server running at http://{self.get_local_ip()}:{self._web_port}")
         
         # Keep the server running
         while True:
@@ -153,29 +277,57 @@ class TemperatureServer:
         # Redirect to the static index.html
         return web.FileResponse(os.path.join("static", "index.html"))
     
-    async def handle_status(self, request):
+    async def handle_get_metrics(self, request):
         """Handle status API requests"""
         return web.json_response(self._last_known_metrics.model_dump())
     
-    async def handle_get_data(self, request):
-        # Get all queryparams from the request
-        query_params = request.query
-        timeframe = query_params.get('timeframe', 'week')
-        
-        if 'timeframe' in query_params:
-            timeframe = query_params['timeframe']
+    async def handle_get_command(self, request):
+        """Handle GET /api/command requests"""
+        if self._current_command:
+            return web.json_response(self._current_command.model_dump())
+        else:
+            return web.json_response({"type": "none", "value": ""})
+    
+    async def handle_post_command(self, request):
+        """Handle POST /api/command requests"""
+        try:
+            data = await request.json()
+            
+            # Validate the command structure
+            if "type" not in data or "value" not in data:
+                return web.json_response(
+                    {"error": "Command must have 'type' and 'value' fields"}, 
+                    status=400
+                )
+            
+            # Create command object
+            self._current_command = Command(type=data["type"], value=data["value"])
+            logger.info(f"New command set: {self._current_command.model_dump()}")
+            self._command_ready_event.set()
 
-        # Get data for the specified timeframe
-        filtered_data = self._solar_logger.get_data(timeframe)
-        # Return the JSON data as a response
-        return web.json_response(filtered_data)
+            return web.json_response({
+                "success": True, 
+                "command": self._current_command.model_dump()
+            })
+            
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        except Exception as e:
+            logger.error(f"Error handling command: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
     
     async def stop(self):
         """Stop all servers"""
         logger.info("Stopping servers...")
         
-        # Stop BLE server
-        self.ble_running = False
+        # Stop BLE peripheral
+        if self._ble_server:
+            try:
+                await self._ble_server.stop()
+                logger.info("BLE peripheral stopped")
+            except Exception as e:
+                logger.error(f"Error stopping BLE peripheral: {e}")
 
 
 # Example usage
