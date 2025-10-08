@@ -51,7 +51,7 @@ class Sensor:
             self._event.set()
             print("Disconnected", connection.device)
                 
-    async def scan_and_read_command(self, server_name="pi"):
+    async def scan_and_read_commands(self, callback, server_name="pi"):
         print("Scanning for 'pi' service...")
         async with aioble.scan(duration_ms=2000, interval_us=30000, window_us=30000, active=True) as scanner:
             async for result in scanner:
@@ -82,8 +82,15 @@ class Sensor:
                             continue
 
                         # Read the characteristic
-                        value = await command_char.read()
-                        print("Command value:", value)
+                        while True:
+                            value = await command_char.read()
+                            cmd = json.loads(value)
+                            if cmd.get('type') != 'eof':
+                                print("Command value:", value)
+                                await callback(cmd)
+                            else:
+                                print("End of commands")
+                                break
 
                         await connection.disconnect()
                         return json.loads(value)
@@ -94,5 +101,6 @@ class Sensor:
 
         print("No 'pi' service found")
         return None
+
 
 

@@ -54,7 +54,7 @@ class TemperatureServer:
         self._name = name
         self._web_port = web_port
         self._last_known_metrics = Metrics()
-        self._current_command = None
+        self._current_command = []  # Changed to list for command queue
         self._ble_server = None
 
         self._command_ready_event = asyncio.Event()
@@ -95,7 +95,7 @@ class TemperatureServer:
                         
                 if not target_device:
                     logger.info("No device with Environmental Sensing Service found.")
-                    await asyncio.sleep(5)  # Wait before retrying
+                    await asyncio.sleep(2)  # Wait before retrying
                     continue
 
                 async with BleakClient(target_device.address) as client:
@@ -172,18 +172,33 @@ class TemperatureServer:
                 logger.info("=" * 60)
 
                 # Keep the peripheral running and update characteristic when needed
-                if self._current_command:
-                    command_json = json.dumps(self._current_command.model_dump())
+                while self._current_command:  # Process all commands in queue
+                    command = self._current_command.pop(0)  # Get first command
+                    command_json = json.dumps(command.model_dump())
                     logger.info(f"Updating BLE characteristic with command: {command_json}")
                     
                     # Update the characteristic value
                     char = self._ble_server.get_characteristic(COMMAND_CHAR_UUID)
                     char.value = bytearray(command_json.encode('utf-8'))
 
-                # Wait for a read request from the client
-                await self._command_read_event.wait()
-                logger.info("BLE command characteristic was read by client.")
-                self._command_read_event.clear()
+                    # Wait for a read request from the client
+                    await self._command_read_event.wait()
+                    logger.info("BLE command characteristic was read by client.")
+                    self._command_read_event.clear()
+
+                # Send EOF command when no more commands
+                if not self._current_command:
+                    eof_command = {"type": "eof", "value": ""}
+                    eof_json = json.dumps(eof_command)
+                    logger.info(f"Sending EOF command: {eof_json}")
+                    
+                    char = self._ble_server.get_characteristic(COMMAND_CHAR_UUID)
+                    char.value = bytearray(eof_json.encode('utf-8'))
+                    
+                    # Wait for EOF to be read
+                    await self._command_read_event.wait()
+                    logger.info("EOF command was read by client.")
+                    self._command_read_event.clear()
 
             except Exception as e:
                 logger.error(f"BLE peripheral initialization error: {e}")
@@ -208,10 +223,10 @@ class TemperatureServer:
             command_data = json.loads(command_str)
             command = Command(**command_data)
             
-            # Store the command (this will be picked up by the web API)
-            self._current_command = command
+            # Add the command to the queue
+            self._current_command.append(command)
             
-            logger.info(f"BLE command stored: {command.model_dump()}")
+            logger.info(f"BLE command added to queue: {command.model_dump()}")
             
         except Exception as e:
             logger.error(f"Error processing BLE write request: {e}")
@@ -248,7 +263,9 @@ class TemperatureServer:
         
         # Set up routes
         app.router.add_get('/', self.handle_index)
-        app.router.add_static('/static/', path='static', name='static')
+        # Get static path relative to this file
+        static_path = os.path.join(os.path.dirname(__file__), 'static')
+        app.router.add_static('/static/', path=static_path, name='static')
 
         # Add API routes with CORS
         app.router.add_get('/api/metrics', self.handle_get_metrics)
@@ -284,9 +301,11 @@ class TemperatureServer:
     async def handle_get_command(self, request):
         """Handle GET /api/command requests"""
         if self._current_command:
-            return web.json_response(self._current_command.model_dump())
+            # Return all commands in queue
+            commands = [cmd.model_dump() for cmd in self._current_command]
+            return web.json_response({"commands": commands, "count": len(commands)})
         else:
-            return web.json_response({"type": "none", "value": ""})
+            return web.json_response({"commands": [], "count": 0})
     
     async def handle_post_command(self, request):
         """Handle POST /api/command requests"""
@@ -301,13 +320,16 @@ class TemperatureServer:
                 )
             
             # Create command object
-            self._current_command = Command(type=data["type"], value=data["value"])
-            logger.info(f"New command set: {self._current_command.model_dump()}")
+            command = Command(type=data["type"], value=data["value"])
+            self._current_command.append(command)  # Add to queue
+            logger.info(f"New command added to queue: {command.model_dump()}")
+            logger.info(f"Command queue length: {len(self._current_command)}")
             self._command_ready_event.set()
 
             return web.json_response({
                 "success": True, 
-                "command": self._current_command.model_dump()
+                "command": command.model_dump(),
+                "queue_length": len(self._current_command)
             })
             
         except json.JSONDecodeError:
@@ -351,7 +373,7 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Server interrupted")
     except Exception as e:
-        logger.error(f"Server error: {e}")
+        logger.error(f"Server error: {e}", exc_info=True)
     finally:
         try:
             await server.stop()

@@ -143,7 +143,7 @@ class ValveControl:
     def is_open(self):
         return self._is_open
 
-def handle_command(cmd):
+async def handle_command(cmd):
     """Handle incoming commands"""
     if not cmd or not isinstance(cmd, dict):
         return
@@ -181,10 +181,12 @@ async def read_temperature_loop():
             # Need to make sure this is read!
             await new_client.send_json(payload)
             print("Reading commands from pi")
-            cmd = await new_client.scan_and_read_command()
-            if cmd:
-                print(f"Got command {json.dumps(cmd)}")
-                handle_command(cmd)
+            
+            try:
+                await new_client.scan_and_read_commands(callback=handle_command)
+            except Exception as e:
+                print(f"Error reading commands: {e}")
+                sys.print_exception(e)
             
             set_pixel(0, 0, 0)
             
@@ -212,3 +214,5 @@ def run():
 # Start the application if this file is executed directly
 if __name__ == "__main__":
     run()
+
+
