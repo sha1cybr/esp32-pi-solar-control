@@ -42,7 +42,7 @@ api:
 
 ota:
   - platform: esphome
-    password: "h0h0h0"
+    password: "xxx"
 
 # Time component for daytime detection
 time:
