@@ -1,0 +1,647 @@
+esphome:
+  name: firebeetle
+  on_boot:
+    priority: -10
+    then:
+      - lambda: |-
+          ESP_LOGI("main", "Releasing GPIO holds from previous sleep cycle");
+          gpio_deep_sleep_hold_dis();
+          gpio_hold_dis(GPIO_NUM_25);
+      - delay: 100ms
+      - script.execute: main_control_loop
+
+esp32:
+  board: firebeetle32
+  framework:
+    type: esp-idf
+
+# WiFi configuration
+wifi:
+  ssid: "XXX"
+  password: "XXX"
+
+  # Fast connect to save power
+  fast_connect: true
+
+  # Power save mode
+  power_save_mode: LIGHT
+
+  # Manual IP can speed up connection
+  manual_ip:
+    static_ip: 192.168.1.177
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+
+# Enable logging
+logger:
+  level: INFO
+
+# Enable Home Assistant API
+api:
+  password: ""
+
+ota:
+  - platform: esphome
+    password: "h0h0h0"
+
+# Time component for daytime detection
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+# One Wire bus configuration (replaces dallas)
+one_wire:
+  - platform: gpio
+    id: tank_bus
+    pin: GPIO13
+
+  - platform: gpio
+    id: solar_bus
+    pin: GPIO14
+
+# Deep sleep configuration
+deep_sleep:
+  id: deep_sleep_control
+  sleep_duration: 150s  # Default 2.5 minutes
+
+# Global variables for settings
+globals:
+  - id: temp_threshold
+    type: float
+    restore_value: yes
+    initial_value: '10.0'
+
+  - id: deep_sleep_enabled
+    type: bool
+    restore_value: no
+    initial_value: 'false'  # Default: disabled (OFF)
+
+  - id: sleep_duration_minutes
+    type: int
+    restore_value: yes
+    initial_value: '150'  # Default 150 seconds (2.5 minutes)
+
+  - id: nighttime_sleep_duration_seconds
+    type: int
+    restore_value: yes
+    initial_value: '3600'  # Default 3600 seconds (60 minutes)
+
+  - id: auto_mode
+    type: bool
+    restore_value: yes
+    initial_value: 'false'  # Default: manual mode (OFF)
+
+  - id: daytime_mode
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  - id: daytime_start_hour
+    type: int
+    restore_value: yes
+    initial_value: '6'  # Default 7 AM
+
+  - id: daytime_end_hour
+    type: int
+    restore_value: yes
+    initial_value: '0'  # Default midnight (0)
+
+  - id: wifi_connect_interval
+    type: int
+    restore_value: yes
+    initial_value: '1'
+
+  - id: wifi_connect_counter
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: valve_needs_wait
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: valve_state
+    type: bool
+    restore_value: yes
+    initial_value: 'false'  # false = closed, true = open
+
+  - id: sensor_retry_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: sensors_ready_logged
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: last_update_timestamp
+    type: unsigned long
+    restore_value: yes
+    initial_value: '0'
+
+# Temperature sensors
+sensor:
+  - platform: dallas_temp
+    one_wire_id: tank_bus
+    name: "Tank Temperature"
+    id: tank_temp
+    accuracy_decimals: 2
+    update_interval: never
+    filters:
+      - filter_out: nan
+      - offset: -0.25
+
+  - platform: dallas_temp
+    one_wire_id: solar_bus
+    name: "Solar Temperature"
+    id: solar_temp
+    accuracy_decimals: 2
+    update_interval: never
+    filters:
+      - filter_out: nan
+
+  # Battery voltage monitoring
+  - platform: adc
+    pin: GPIO34
+    name: "Battery Voltage"
+    id: battery_voltage
+    attenuation: 12db
+    filters:
+      - multiply: 2.0
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+    update_interval: 60s
+    accuracy_decimals: 2
+
+  - platform: template
+    name: "Battery Level"
+    id: battery_level
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    lambda: |-
+      // Map voltage to percent (adjust cutoffs to your preference)
+      const float v = id(battery_voltage).state;
+      const float v_min = 3.0;   // 0%
+      const float v_max = 4.2;   // 100%
+      if (v <= v_min) return 0.0;
+      if (v >= v_max) return 100.0;
+      return (v - v_min) * 100.0 / (v_max - v_min);
+
+  - platform: template
+    name: "Last Updated"
+    id: last_updated_sensor
+    device_class: timestamp
+    lambda: |-
+      return 0;
+    update_interval: never
+
+# Input numbers for Home Assistant (settings)
+number:
+  - platform: template
+    name: "Temperature Threshold"
+    id: threshold_setting
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 30
+    step: 0.5
+    initial_value: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer-lines"
+    on_value:
+      then:
+        - globals.set:
+            id: temp_threshold
+            value: !lambda 'return x;'
+
+  - platform: template
+    name: "Sleep Duration"
+    id: sleep_duration_setting
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 300
+    step: 1
+    initial_value: 300
+    unit_of_measurement: "s"
+    icon: "mdi:sleep"
+    mode: box
+    on_value:
+      then:
+        - globals.set:
+            id: sleep_duration_minutes
+            value: !lambda 'return (int)x;'
+
+  - platform: template
+    name: "Nighttime Sleep Duration"
+    id: nighttime_sleep_duration_setting
+    optimistic: true
+    restore_value: true
+    min_value: 60
+    max_value: 7200
+    step: 60
+    initial_value: 3600
+    unit_of_measurement: "s"
+    icon: "mdi:weather-night"
+    mode: box
+    on_value:
+      then:
+        - globals.set:
+            id: nighttime_sleep_duration_seconds
+            value: !lambda 'return (int)x;'
+
+  - platform: template
+    name: "WiFi Connect Interval"
+    id: wifi_interval_setting
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 20
+    step: 1
+    initial_value: 1
+    unit_of_measurement: "wakes"
+    icon: "mdi:wifi-sync"
+    mode: box
+    on_value:
+      then:
+        - globals.set:
+            id: wifi_connect_interval
+            value: !lambda 'return (int)x;'
+
+  - platform: template
+    name: "Daytime Start Hour"
+    id: daytime_start_hour_setting
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 23
+    step: 1
+    initial_value: 6
+    unit_of_measurement: "hour"
+    icon: "mdi:weather-sunrise"
+    mode: box
+    on_value:
+      then:
+        - globals.set:
+            id: daytime_start_hour
+            value: !lambda 'return (int)x;'
+
+  - platform: template
+    name: "Daytime End Hour"
+    id: daytime_end_hour_setting
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 23
+    step: 1
+    initial_value: 0
+    unit_of_measurement: "hour"
+    icon: "mdi:weather-sunset"
+    mode: box
+    on_value:
+      then:
+        - globals.set:
+            id: daytime_end_hour
+            value: !lambda 'return (int)x;'
+
+# Switches for control
+switch:
+  - platform: gpio
+    pin: GPIO25
+    id: boost_enable
+    restore_mode: RESTORE_DEFAULT_OFF  # Default HIGH (boost converter OFF)
+    inverted: true  # Inverted: LOW = enable boost, HIGH = disable boost
+    internal: true  # Hidden from Home Assistant - controlled automatically
+    # GPIO deep sleep hold maintains exact GPIO25 state during sleep cycles
+
+  - platform: gpio
+    pin:
+      number: GPIO26
+      mode:
+        output: true
+        open_drain: true
+    id: valve_open_pin
+    restore_mode: RESTORE_DEFAULT_OFF
+    internal: true  # Hidden from Home Assistant
+    inverted: true  # Active LOW - turning ON sinks to GND (open-drain mode)
+    # Connected to latching relay S pin (Set) - triggers when pulled LOW (GND)
+
+  - platform: gpio
+    pin:
+      number: GPIO0
+      mode:
+        output: true
+        open_drain: true
+    id: valve_close_pin
+    restore_mode: RESTORE_DEFAULT_OFF
+    internal: true  # Hidden from Home Assistant
+    inverted: true  # Active LOW - turning ON sinks to GND (open-drain mode)
+    # Connected to latching relay R pin (Reset) - triggers when pulled LOW (GND)
+
+  - platform: template
+    name: "Auto Mode"
+    id: auto_mode_switch
+    optimistic: true
+    icon: "mdi:auto-mode"
+    restore_mode: RESTORE_DEFAULT_OFF  # Default: manual mode (OFF)
+    on_turn_on:
+      then:
+        - globals.set:
+            id: auto_mode
+            value: 'true'
+    on_turn_off:
+      then:
+        - globals.set:
+            id: auto_mode
+            value: 'false'
+
+  - platform: template
+    name: "Valve Open"
+    id: valve_open_switch
+    icon: "mdi:valve-open"
+    restore_mode: DISABLED  # Don't restore from Home Assistant - state is determined by valve_state global via lambda
+    optimistic: true
+    inverted: false
+    turn_on_action:
+      - script.execute: open_valve   # ON = open valve
+    turn_off_action:
+      - script.execute: close_valve  # OFF = close valve
+    lambda: |-
+      return !id(valve_state);
+
+# Binary sensors for status
+binary_sensor:
+  - platform: homeassistant
+    entity_id: input_boolean.solar_deep_sleep
+    id: deep_sleep_switch
+    internal: false
+    on_state:
+      - lambda: |-
+          id(deep_sleep_enabled) = x;
+          ESP_LOGI("main", "Deep sleep %s from Home Assistant", x ? "enabled" : "disabled");
+# Scripts for valve control and main loop
+script:
+  - id: close_valve
+    then:
+      - switch.turn_off: valve_close_pin  # Ensure GPIO0 (R pin) is HIGH (inactive)
+      - switch.turn_on: valve_open_pin    # Set GPIO26 (S pin) LOW (GND) - ready to trigger relay SET
+      - delay: 10ms  # Brief delay to ensure pin state is set
+      - switch.turn_on: boost_enable  # Enable boost converter (pin already LOW, triggers relay)
+      - delay: 1000ms  # Hold pulse for 1000ms (within 0.1-2s recommended range)
+      - switch.turn_off: valve_open_pin   # Return GPIO26 to HIGH (inactive)
+      - lambda: |-
+          id(valve_state) = true;
+          ESP_LOGI("main", "Valve closing");
+          id(valve_open_switch).publish_state(!id(valve_state));
+
+      - delay: 5s  # Wait 5 seconds after valve operation
+      - switch.turn_off: boost_enable  # Disable boost converter
+
+  - id: open_valve
+    then:
+      - switch.turn_off: valve_open_pin   # Ensure GPIO26 (S pin) is HIGH (inactive)
+      - switch.turn_on: valve_close_pin   # Set GPIO0 (R pin) LOW (GND) - ready to trigger relay RESET
+      - delay: 10ms  # Brief delay to ensure pin state is set
+      - switch.turn_on: boost_enable  # Enable boost converter (pin already LOW, triggers relay)
+      - delay: 1000ms  # Hold pulse for 1000ms (within 0.1-2s recommended range)
+      - switch.turn_off: valve_close_pin  # Return GPIO0 to HIGH (inactive)
+      - lambda: |-
+          id(valve_state) = false;
+          ESP_LOGI("main", "Valve opening");
+          id(valve_open_switch).publish_state(!id(valve_state));
+      - delay: 5s  # Wait 5 seconds after valve operation
+      - switch.turn_off: boost_enable  # Disable boost converter
+
+  - id: main_control_loop
+    mode: restart
+    then:
+      # Determine if it's daytime (configurable hours)
+      - lambda: |-
+          ESP_LOGI("main", "Starting main control loop after wake-up");
+          id(wifi_connect_counter) += 1;
+          auto time = id(homeassistant_time).now();
+          int hour = time.hour;
+          int start_hour = id(daytime_start_hour);
+          int end_hour = id(daytime_end_hour);
+          
+          // Determine if current hour is within daytime range
+          // Handle case where end_hour is 0 (midnight) - daytime from start_hour to 23:59
+          bool is_daytime;
+          if (end_hour == 0) {
+            // Daytime from start_hour to midnight (23:59)
+            is_daytime = (hour >= start_hour);
+          } else if (start_hour <= end_hour) {
+            // Normal case: start_hour < end_hour (e.g., 6 to 22)
+            is_daytime = (hour >= start_hour && hour < end_hour);
+          } else {
+            // Wraparound case: start_hour > end_hour (e.g., 22 to 6)
+            is_daytime = (hour >= start_hour || hour < end_hour);
+          }
+          
+          id(daytime_mode) = is_daytime;
+          ESP_LOGI("main", "Current hour: %d, Daytime range: %d-%d, Daytime mode: %s", 
+                   hour, start_hour, end_hour, id(daytime_mode) ? "true" : "false");
+
+
+      # Critical: Wait for sensors to power up and stabilize after deep sleep
+      # Dallas sensors need at least 500ms-2s after power-on before responding to OneWire commands
+      # After deep sleep and power cycle, they need time to initialize properly
+
+      # WiFi connection logic - this also gives sensors additional time to stabilize
+      - if:
+          condition:
+            lambda: |-
+              bool should_connect = (id(wifi_connect_counter) >= id(wifi_connect_interval)) || id(daytime_mode);
+
+              if (should_connect) {
+                ESP_LOGI("main", "Connecting to WiFi for sync (counter: %d, interval: %d)...",
+                         id(wifi_connect_counter), id(wifi_connect_interval));
+                id(wifi_connect_counter) = 0;
+              } else {
+                ESP_LOGI("main", "Skipping WiFi connection (counter: %d of %d)",
+                         id(wifi_connect_counter), id(wifi_connect_interval));
+              }
+
+              return should_connect;
+          then:
+            - wait_until:
+                wifi.connected:
+            - delay: 3s
+            # Sync deep_sleep_enabled with Home Assistant binary sensor state
+            - lambda: |-
+                bool sensor_state = id(deep_sleep_switch).state;
+                id(deep_sleep_enabled) = sensor_state;
+                ESP_LOGI("main", "Synced deep_sleep_enabled to %s from Home Assistant binary sensor", sensor_state ? "true" : "false");
+
+      - wait_until:
+          api.connected:
+      - lambda: |-
+          if (id(homeassistant_time).now().is_valid()) {
+            id(last_update_timestamp) = id(homeassistant_time).now().timestamp;
+            if (id(last_update_timestamp) > 0) {
+              id(last_updated_sensor).publish_state((float)id(last_update_timestamp));
+              ESP_LOGI("main", "Published timestamp: %llu", id(last_update_timestamp));
+            }
+          }
+
+      # Retry sensor updates until they're ready (Dallas sensors need time to stabilize after power-on)
+      # After deep sleep, OneWire bus needs time to properly initialize and sensors need time to respond
+      - lambda: |-
+          id(sensor_retry_count) = 0;  // Reset retry counter
+          id(sensors_ready_logged) = false;  // Reset ready flag
+
+      - component.update: tank_temp
+      - component.update: solar_temp
+      - component.update: battery_voltage
+
+      - delay: 1s  # Longer initial delay after first update to allow OneWire bus to stabilize
+      - repeat:
+          count: 10  # Maximum 20 retries
+          then:
+            - if:
+                condition:
+                  lambda: |-
+                    float tank = id(tank_temp).state;
+                    float solar = id(solar_temp).state;
+                    bool sensors_not_ready = isnan(tank) || isnan(solar);
+
+                    if (sensors_not_ready) {
+                      id(sensor_retry_count)++;
+                      ESP_LOGI("main", "Dallas sensors not ready yet (attempt %d), retrying...", id(sensor_retry_count));
+                      return true;  // Continue updating
+                    } else {
+                      // Sensors are ready - only log once
+                      if (!id(sensors_ready_logged)) {
+                        ESP_LOGI("main", "Dallas sensors ready after %d attempts: Tank=%.1f°C, Solar=%.1f°C",
+                                 id(sensor_retry_count), tank, solar);
+                        id(sensors_ready_logged) = true;
+                        // Update last update timestamp when sensors are ready
+                        if (id(homeassistant_time).now().is_valid()) {
+                          id(last_update_timestamp) = id(homeassistant_time).now().timestamp;
+                          // Immediately update the sensor state in Home Assistant
+                          id(last_updated_sensor).publish_state((float)id(last_update_timestamp));
+                        }
+                      }
+                      return false;  // Stop updating, but loop will continue (harmless)
+                    }
+                then:
+                  - component.update: tank_temp
+                  - component.update: solar_temp
+                  - component.update: battery_voltage
+                  - delay: 1500ms  # Longer delay between retries - Dallas sensors need ~750ms for conversion plus bus overhead
+      # Control logic - determine if valve needs to change
+      - lambda: |-
+          float tank = id(tank_temp).state;
+          float solar = id(solar_temp).state;
+          float threshold = id(temp_threshold);
+
+          ESP_LOGI("main", "Tank: %.1f°C, Solar: %.1f°C, Threshold: %.1f°C", tank, solar, threshold);
+
+          if (id(auto_mode)) {
+            if (!isnan(tank) && !isnan(solar)) {
+              bool should_open = (solar - tank) > threshold;
+              bool currently_open = !id(valve_state);
+
+              if (should_open && !currently_open) {
+                ESP_LOGI("main", "AUTO: Need to open valve (solar %.1f°C > tank %.1f°C + threshold %.1f°C)",
+                         solar, tank, threshold);
+                id(valve_needs_wait) = true;
+              } else if (!should_open && currently_open) {
+                ESP_LOGI("main", "AUTO: Need to close valve (temp difference insufficient)");
+                id(valve_needs_wait) = true;
+              } else {
+                ESP_LOGI("main", "AUTO: Valve already %s, no change needed", currently_open ? "open" : "closed");
+                id(valve_needs_wait) = false;
+              }
+            } else {
+              id(valve_needs_wait) = false;
+            }
+          } else {
+            // In manual mode, valve state is controlled directly via Home Assistant
+            // or other external controls, so we just log the current state
+            ESP_LOGI("main", "MANUAL: Valve is %s", id(valve_state) ? "closed" : "open");
+            id(valve_needs_wait) = false;
+          }
+
+      # Only operate valve if state needs to change (boost converter already enabled on startup)
+      - if:
+          condition:
+            lambda: 'return id(valve_needs_wait);'
+          then:
+            - lambda: |-
+                float tank = id(tank_temp).state;
+                float solar = id(solar_temp).state;
+                float threshold = id(temp_threshold);
+                bool should_open = (solar - tank) > threshold;
+
+                if (should_open) {
+                  ESP_LOGI("main", "AUTO: Opening valve");
+                } else {
+                  ESP_LOGI("main", "AUTO: Closing valve");
+                }
+
+            - if:
+                condition:
+                  lambda: |-
+                    float tank = id(tank_temp).state;
+                    float solar = id(solar_temp).state;
+                    float threshold = id(temp_threshold);
+                    return (solar - tank) > threshold;
+                then:
+                  - script.execute: open_valve
+                  - script.wait: open_valve
+                else:
+                  - script.execute: close_valve
+                  - script.wait: close_valve
+      # Calculate sleep duration (only if deep sleep is enabled)
+      - lambda: |-
+          bool sleep_enabled = id(deep_sleep_enabled);
+
+          if (sleep_enabled) {
+            int sleep_seconds;
+
+            if (!id(daytime_mode)) {
+              sleep_seconds = id(nighttime_sleep_duration_seconds);
+              ESP_LOGI("main", "Nighttime: sleep for %d seconds", sleep_seconds);
+            } else {
+              sleep_seconds = id(sleep_duration_minutes);
+              ESP_LOGI("main", "Daytime: sleep for %d seconds", sleep_seconds);
+            }
+
+            id(deep_sleep_control).set_sleep_duration(sleep_seconds * 1000);
+            ESP_LOGI("main", "Going to deep sleep for %d seconds...", sleep_seconds);
+          } else {
+            ESP_LOGI("main", "Deep sleep is DISABLED - staying awake");
+          }
+
+      - if:
+          condition:
+            lambda: 'return id(deep_sleep_enabled);'
+          then:
+            - lambda: |-
+                ESP_LOGI("main", "Enabling GPIO hold for deep sleep");
+                ESP_LOGI("main", "Boost converter EN (GPIO25): %s", id(boost_enable).state ? "ON (LOW)" : "OFF (HIGH)");
+                // Step 1: Enable hold on GPIO25 (boost converter EN) to maintain state
+                gpio_hold_en(GPIO_NUM_25);
+                // Step 2: Enable deep sleep hold globally to maintain all held GPIOs during sleep
+                gpio_deep_sleep_hold_en();
+            - deep_sleep.enter: deep_sleep_control
+          else:
+            - delay: 10s  # optional, wait a bit before running again
+            - script.execute: main_control_loop
+
+# Text sensors for status
+text_sensor:
+  - platform: template
+    name: "Controller Mode"
+    icon: "mdi:state-machine"
+    lambda: |-
+      if (id(auto_mode)) {
+        return {"Auto"};
+      } else {
+        return {"Manual"};
+      }
+    update_interval: 60s
